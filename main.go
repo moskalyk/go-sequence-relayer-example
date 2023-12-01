@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	"strings"
@@ -15,7 +17,7 @@ import (
 	"github.com/0xsequence/ethkit/go-ethereum/common"
 	"github.com/0xsequence/go-sequence"
 	"github.com/0xsequence/go-sequence/core"
-	v1 "github.com/0xsequence/go-sequence/core/v1"
+	v2 "github.com/0xsequence/go-sequence/core/v2"
 	"github.com/0xsequence/go-sequence/relayer"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -75,25 +77,87 @@ type Relayer interface {
 
 func main() {
 
+	// eoa, _ := ethwallet.NewWalletFromRandomEntropy()
 	eoa, _ := ethwallet.NewWalletFromPrivateKey("")
 
-	w, _ := sequence.GenericNewWalletSingleOwner[*v1.WalletConfig](eoa, sequence.WalletContext{
-		FactoryAddress:    common.HexToAddress("0x5FbDB2315678afecb367f032d93F642f64180aa3"),
-		MainModuleAddress: common.HexToAddress("0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"),
-	})
+	w, err := sequence.GenericNewWalletSingleOwner[*v2.WalletConfig](eoa, sequence.V2SequenceContext())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// set provider
+	nodeURL := "https://nodes.sequence.app/arbitrum-nova" // Replace with your actual node URL
+	p, err := ethrpc.NewProvider(nodeURL)
+	if err != nil {
+		log.Fatalf("failed to create new provider: %v", err)
+	}
+	w.SetProvider(p)
 
 	// address
-	println("{}", w.Address().Hex())
-	nonce, _ := w.GetNonce()
+	fmt.Println("relayer wallet address:", w.Address().Hex())
 
-	// nonce
-	println("{}", nonce)
+	log := logger.NewLogger(logger.LogLevel_DEBUG)
 
+	// Receipts listener
+	monitorOptions := ethmonitor.DefaultOptions
+	monitorOptions.Logger = log
+	monitorOptions.WithLogs = true
+	monitorOptions.BlockRetentionLimit = 400
+	monitorOptions.StartBlockNumber = big.NewInt(-20)
+
+	monitor, err := ethmonitor.NewMonitor(p, monitorOptions)
+	if err != nil {
+		log.Fatalf("monitor create failed: %v", err)
+	}
+
+	receiptsListener, err := ethreceipts.NewReceiptsListener(log, p, monitor)
+	if err != nil {
+		log.Fatalf("receiptlistener create failed: %v", err)
+	}
+
+	// Setup Relayer on the wallet
+	relayerURL := "https://arbitrum-nova-relayer.sequence.app"
+	relayer, err := relayer.NewRpcRelayer(p, receiptsListener, relayerURL, http.DefaultClient)
+	if err != nil {
+		log.Fatalf("failed to create new rpc relayer client: %v", err)
+	}
+
+	err = w.SetRelayer(relayer)
+	if err != nil {
+		log.Fatalf("failed to set relayer: %v", err)
+	}
+
+	// wallet must be deployed first..
+	isDeployed, err := w.IsDeployed()
+	if err != nil {
+		log.Fatalf("is deployed call failed: %v", err)
+	}
+	fmt.Println("is deployed?", isDeployed)
+
+	// TODO/NOTE: I'm pretty sure we have to deploy this wallet first...?
+	if !isDeployed {
+		_, _, waitReceipt, err := w.Deploy(context.Background())
+		if err != nil {
+			log.Fatal("failed to deploy wallet: %v", err)
+		}
+		fmt.Println("waiting for wallet deployment txn..")
+		receipt, err := waitReceipt(context.Background())
+		if err != nil {
+			log.Fatal("failed to get deploy wallet receipt: %v", err)
+		}
+		fmt.Println("wallet deployed, txn hash:", receipt.TxHash)
+	}
+
+	// The actual transactiom
 	var functionAbi = `[{"type":"function","name":"mint","inputs":[{"type":"uint256","name":"amount"}]}]`
-
 	parsedAbi, _ := abi.JSON(strings.NewReader(functionAbi))
 	calldata, _ := parsedAbi.Pack("mint", 100)
 
+	// nonce
+	nonce, _ := w.GetNonce()
+	fmt.Println("nonce:", nonce)
+
+	// txn
 	txs := &sequence.Transaction{
 		To:            common.HexToAddress("0xdB59649AAD68e1E44911281748667a5F5b52fed2"),
 		Data:          calldata,
@@ -104,26 +168,26 @@ func main() {
 		Nonce:         nonce,
 	}
 
-	nodeURL := "https://nodes.sequence.app/arbitrum-nova" // Replace with your actual node URL
+	// Sign the transaction
+	signed, err := w.SignTransaction(context.Background(), txs)
+	if err != nil {
+		log.Fatalf("failed to sign transaction: %v", err)
+	}
 
-	p, _ := ethrpc.NewProvider(nodeURL)
-	log := logger.NewLogger(logger.LogLevel_DEBUG)
+	// Send the transaction
+	metaTxnID, _, waitReceipt, err := w.SendTransaction(context.Background(), signed)
+	if err != nil {
+		log.Fatal("failed to send transaction: %v", err)
+	}
+	fmt.Println("sent sequence metaTxnID:", metaTxnID)
 
-	monitorOptions := ethmonitor.DefaultOptions
-	monitorOptions.Logger = log
-	monitorOptions.WithLogs = true
-	monitorOptions.BlockRetentionLimit = 1000
+	// Wait for txn to be mined + get receipt
+	fmt.Println("waiting for the txn to be mined and get the receipt...")
 
-	monitor, _ := ethmonitor.NewMonitor(p, monitorOptions)
+	receipt, err := waitReceipt(context.Background())
+	if err != nil {
+		log.Fatalf("failed to wait for receipt: %v", err)
+	}
 
-	receipts, _ := ethreceipts.NewReceiptsListener(log, p, monitor)
-
-	relayer, _ := relayer.NewRpcRelayer(p, receipts, nodeURL, http.DefaultClient)
-	_ = w.SetRelayer(relayer)
-
-	signed, _ := w.SignTransaction(context.Background(), txs)
-	metaTxnID, _, _, err := w.SendTransaction(context.Background(), signed)
-
-	println("{}", metaTxnID)
-	println("{}", err)
+	fmt.Println("got the txn receipt!", receipt.TxHash.String())
 }
